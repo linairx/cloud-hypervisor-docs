@@ -946,3 +946,413 @@ Cloud Hypervisor **不支持 LXC 容器**，它们是不同层次的虚拟化技
 - [virtio-input 规范](https://www.linux.org/threads/virtio-input-device.13770/)
 - [NVIDIA vGPU](https://www.nvidia.com/en-us/data-center/virtualization/)
 - [Intel SR-IOV](https://www.intel.com/content/www/us/en/developer/articles/technical/introduction-to-sr-iov.html)
+
+---
+
+## 多 VM API 设计
+
+本章节描述 lg-capture 集成的多 VM API 设计，支持同时管理多个虚拟机。
+
+### 运行模式
+
+Cloud Hypervisor 支持两种运行模式：
+
+#### 模式 1: 单进程单 VM (当前默认)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Host System                             │
+│                                                              │
+│  ┌─────────────────┐  ┌─────────────────┐                  │
+│  │ Cloud Hypervisor│  │ Cloud Hypervisor│     ...           │
+│  │ Process 1       │  │ Process 2       │                   │
+│  │ :8000           │  │ :8001           │                   │
+│  │ ┌─────────────┐ │  │ ┌─────────────┐ │                   │
+│  │ │ VM1         │ │  │ │ VM2         │ │                   │
+│  │ └─────────────┘ │  │ └─────────────┘ │                   │
+│  └─────────────────┘  └─────────────────┘                  │
+│                                                              │
+│  通过不同端口区分 VM                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 模式 2: 单进程多 VM (API Server 模式)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Host System                             │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │              Cloud Hypervisor (API Server)            │  │
+│  │                     :8000                             │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │                 VM Manager                      │  │  │
+│  │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐        │  │  │
+│  │  │  │ VM 1    │  │ VM 2    │  │ VM 3    │        │  │  │
+│  │  │  │ id: abc  │  │ id: def  │  │ id: ghi │        │  │  │
+│  │  │  └─────────┘  └─────────┘  └─────────┘        │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  通过 URL 中的 VM ID 区分                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### API 端点设计
+
+#### VMM 级别 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/vmm.ping` | GET | 健康检查 |
+| `/vmm.shutdown` | PUT | 关闭 VMM |
+
+#### VM 管理 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/vm.create` | POST | 创建新 VM |
+| `/vm.list` | GET | 列出所有 VM |
+| `/vm/{vm_id}` | GET | 获取 VM 信息 |
+| `/vm/{vm_id}` | DELETE | 删除 VM |
+
+#### 输入 API (多 VM 支持)
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/vm/{vm_id}/inject-input` | POST | 向指定 VM 注入输入 |
+| `/vm/{vm_id}/input-info` | GET | 获取 VM 输入后端信息 |
+| `/vm/{vm_id}/switch-input-backend` | PUT | 切换 VM 输入后端 |
+
+#### 向后兼容 API (单 VM 模式)
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/vm.inject-input` | POST | 向默认 VM 注入输入 |
+| `/vm.input-info` | GET | 获取默认 VM 输入信息 |
+
+---
+
+### API 请求格式
+
+#### 创建 VM
+
+```bash
+POST /vm.create
+Content-Type: application/json
+
+{
+  "name": "windows-vm-1",
+  "cpus": 4,
+  "memory": "4G",
+  "input_config": {
+    "default_backend": "ps2",
+    "usb_keyboard_config": {
+      "vendor_id": 4617,
+      "product_id": 49948,
+      "manufacturer": "Logitech",
+      "product": "USB Keyboard"
+    }
+  }
+}
+
+# 响应
+{
+  "vm_id": "abc123-def456-ghi789"
+}
+```
+
+#### 列出所有 VM
+
+```bash
+GET /vm.list
+
+# 响应
+{
+  "vms": [
+    {
+      "id": "abc123-def456-ghi789",
+      "name": "windows-vm-1",
+      "state": "running",
+      "input_backend": "ps2"
+    },
+    {
+      "id": "xyz789-uvw456-rst123",
+      "name": "windows-vm-2",
+      "state": "running",
+      "input_backend": "usb"
+    }
+  ]
+}
+```
+
+#### 注入输入事件
+
+```bash
+POST /vm/abc123-def456-ghi789/inject-input
+Content-Type: application/json
+
+{
+  "backend": "ps2",
+  "keyboard": [
+    {"action": "type", "scancode": 4}
+  ],
+  "mouse": [
+    {"action": "move", "x": 100, "y": -50},
+    {"action": "button_press", "button": "left"}
+  ]
+}
+```
+
+**请求字段说明:**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `backend` | string | 可选，临时切换后端: `ps2`, `usb`, `virtio` |
+| `keyboard` | array | 键盘事件数组 |
+| `mouse` | array | 鼠标事件数组 |
+
+**键盘事件:**
+
+```json
+{
+  "action": "press" | "release" | "type",
+  "scancode": 4,
+  "modifiers": 0
+}
+```
+
+**鼠标事件:**
+
+```json
+{
+  "action": "move" | "move_absolute" | "button_press" | "button_release" | "wheel",
+  "x": 100,
+  "y": -50,
+  "button": "left" | "right" | "middle",
+  "delta": 1
+}
+```
+
+#### 切换输入后端
+
+```bash
+PUT /vm/abc123-def456-ghi789/switch-input-backend
+Content-Type: application/json
+
+{
+  "backend": "usb"
+}
+```
+
+#### 获取输入后端信息
+
+```bash
+GET /vm/abc123-def456-ghi789/input-info
+
+# 响应
+{
+  "active_backend": "ps2",
+  "available_backends": ["ps2", "usb", "virtio"],
+  "capabilities": {
+    "supports_absolute_mouse": false,
+    "supports_multi_touch": false,
+    "max_keyboard_rate": 500,
+    "stealth_level": "high"
+  },
+  "is_ready": true
+}
+```
+
+---
+
+### 使用示例
+
+#### 场景 1: 向不同 VM 注入不同输入
+
+```bash
+# VM 1 使用 PS/2 (高隐蔽性场景)
+curl -X POST http://localhost:8000/vm/abc123-def456-ghi789/inject-input \
+  -H "Content-Type: application/json" \
+  -d '{
+    "keyboard": [{"action": "type", "scancode": 4}],
+    "mouse": [{"action": "move", "x": 10, "y": 5}]
+  }'
+
+# VM 2 使用 USB HID (RPA 场景)
+curl -X POST http://localhost:8000/vm/xyz789-uvw456-rst123/inject-input \
+  -H "Content-Type: application/json" \
+  -d '{
+    "backend": "usb",
+    "keyboard": [{"action": "press", "scancode": 30}],
+    "mouse": [{"action": "button_press", "button": "left"}]
+  }'
+```
+
+#### 场景 2: 动态切换后端
+
+```bash
+# 检测到反作弊，切换到 PS/2
+curl -X PUT http://localhost:8000/vm/xyz789-uvw456-rst123/switch-input-backend \
+  -H "Content-Type: application/json" \
+  -d '{"backend": "ps2"}'
+
+# 普通自动化，使用 USB
+curl -X PUT http://localhost:8000/vm/xyz789-uvw456-rst123/switch-input-backend \
+  -H "Content-Type: application/json" \
+  -d '{"backend": "usb"}'
+```
+
+#### 场景 3: 批量操作
+
+```bash
+# 使用脚本批量向多个 VM 注入
+for vm_id in "abc123" "def456" "ghi789"; do
+  curl -X POST "http://localhost:8000/vm/${vm_id}/inject-input" \
+    -H "Content-Type: application/json" \
+    -d '{"keyboard": [{"action": "type", "scancode": 28}]}'
+done
+```
+
+---
+
+### 输入后端架构
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        Cloud Hypervisor                           │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │                    Input Manager                             │ │
+│  │  ┌─────────────────────────────────────────────────────────┐│ │
+│  │  │              Input Backend Router                       ││ │
+│  │  │  - 根据配置选择后端                                     ││ │
+│  │  │  - 支持运行时切换                                       ││ │
+│  │  │  - 统一的 HTTP API 接口                                 ││ │
+│  │  └─────────────────────────────────────────────────────────┘│ │
+│  │                          │                                   │ │
+│  │           ┌──────────────┼──────────────┐                   │ │
+│  │           ▼              ▼              ▼                   │ │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────┐   │ │
+│  │  │ PS/2 (i8042)│ │ USB HID     │ │ virtio-input        │   │ │
+│  │  │             │ │ (xHCI)      │ │                     │   │ │
+│  │  │ 最隐蔽      │ │ 平衡方案    │ │ 最简单              │   │ │
+│  │  │ 自动化场景  │ │ RPA场景     │ │ 普通场景            │   │ │
+│  │  └─────────────┘ └─────────────┘ └─────────────────────┘   │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### VM 管理器实现
+
+```rust
+// vmm/src/manager.rs
+
+use std::collections::HashMap;
+use uuid::Uuid;
+
+pub type VmId = String;
+
+pub struct VmManager {
+    vms: HashMap<VmId, VmInstance>,
+    default_vm: Option<VmId>,
+}
+
+pub struct VmInstance {
+    pub id: VmId,
+    pub name: String,
+    pub state: VmState,
+    pub input_manager: InputManager,
+    pub config: VmConfig,
+}
+
+impl VmManager {
+    /// 创建新 VM
+    pub fn create_vm(&mut self, config: VmConfig) -> Result<VmId, VmError> {
+        let id = Uuid::new_v4().to_string();
+        let input_manager = InputManager::new(config.input_config.clone());
+
+        let vm = VmInstance {
+            id: id.clone(),
+            name: config.name.clone(),
+            state: VmState::Creating,
+            input_manager,
+            config,
+        };
+
+        self.vms.insert(id.clone(), vm);
+
+        if self.default_vm.is_none() {
+            self.default_vm = Some(id.clone());
+        }
+
+        Ok(id)
+    }
+
+    /// 获取 VM (支持空 ID 返回默认 VM)
+    pub fn get_vm(&self, id: &str) -> Option<&VmInstance> {
+        if id.is_empty() {
+            self.default_vm.as_ref().and_then(|did| self.vms.get(did))
+        } else {
+            self.vms.get(id)
+        }
+    }
+
+    /// 获取可变 VM
+    pub fn get_vm_mut(&mut self, id: &str) -> Option<&mut VmInstance> {
+        if id.is_empty() {
+            let default_id = self.default_vm.clone()?;
+            self.vms.get_mut(&default_id)
+        } else {
+            self.vms.get_mut(id)
+        }
+    }
+
+    /// 列出所有 VM
+    pub fn list_vms(&self) -> Vec<VmSummary> {
+        self.vms.values().map(|vm| VmSummary {
+            id: vm.id.clone(),
+            name: vm.name.clone(),
+            state: vm.state.clone(),
+            input_backend: vm.input_manager.active_backend_name(),
+        }).collect()
+    }
+}
+```
+
+---
+
+### 错误响应
+
+```json
+{
+  "error": "VM not found: abc123",
+  "code": "VM_NOT_FOUND"
+}
+```
+
+**错误代码:**
+
+| 代码 | HTTP 状态 | 说明 |
+|------|----------|------|
+| `VM_NOT_FOUND` | 404 | VM ID 不存在 |
+| `BACKEND_NOT_AVAILABLE` | 400 | 请求的后端不可用 |
+| `INVALID_INPUT_EVENT` | 400 | 输入事件格式错误 |
+| `BACKEND_ERROR` | 500 | 后端注入失败 |
+| `VM_BUSY` | 503 | VM 正忙 |
+
+---
+
+### 设计要点
+
+| 要点 | 说明 |
+|------|------|
+| **URL 路径** | `/vm/{vm_id}/xxx` 格式，VM ID 使用 UUID |
+| **向后兼容** | 单 VM 模式可使用 `/vm.xxx` 省略 ID |
+| **动态切换** | 支持运行时切换输入后端 |
+| **隔离性** | 每个 VM 有独立的输入管理器 |
+| **统一接口** | 所有后端使用相同的 API 格式 |
