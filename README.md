@@ -600,7 +600,116 @@ memcpy(pSharedMemory, framebuffer, size);
 
 Cloud Hypervisor 目前不支持 virtio-input，需要新增。
 
-#### 方案 1: 新增 virtio-input (推荐)
+> **重要考量**: 虚拟设备 vs 物理设备模拟
+>
+> 在自动化场景中，很多软件会检测输入设备类型：
+> - 游戏反作弊可能拒绝虚拟设备输入
+> - RPA 软件可能只识别特定设备类型
+> - 安全软件可能拦截虚拟设备
+>
+> 因此需要根据使用场景选择合适的模拟方式。
+
+| 方案 | 自动化兼容 | 隐蔽性 | 实现复杂度 | 推荐场景 |
+|------|-----------|--------|-----------|----------|
+| **PS/2 (i8042)** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | 反作弊、高安全要求 |
+| **USB HID (xHCI)** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐ | 通用自动化、RPA |
+| **virtio-input** | ⭐⭐ | ⭐ | ⭐⭐⭐⭐ | 普通 VM、无检测场景 |
+
+#### 方案 1: PS/2 设备模拟 (最隐蔽，推荐用于自动化场景)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Cloud Hypervisor                          │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │              i8042 + PS/2 设备模拟                      ││
+│  │  ┌─────────────────────────────────────────────────────┐││
+│  │  │  完整 PS/2 控制器模拟                               │││
+│  │  │                                                     │││
+│  │  │  键盘:                                              │││
+│  │  │  - 标准 AT 键盘协议                                 │││
+│  │  │  - 扫描码 Set 1/2/3 支持                            │││
+│  │  │  - 看起来像物理 i8042 设备                          │││
+│  │  │                                                     │││
+│  │  │  鼠标:                                              │││
+│  │  │  - PS/2 鼠标协议                                    │││
+│  │  │  - Intellimouse 扩展 (滚轮)                         │││
+│  │  │  - Intellimouse Explorer 扩展 (5键)                 │││
+│  │  └─────────────────────────────────────────────────────┘││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+**PS/2 协议实现:**
+
+```rust
+// devices/src/legacy/i8042_extended.rs
+
+/// 扩展的 i8042 控制器，支持完整的 PS/2 键盘和鼠标
+pub struct I8042DeviceExtended {
+    // 原有功能
+    reset_evt: EventFd,
+
+    // 新增: 键盘缓冲区
+    keyboard_buffer: VecDeque<u8>,
+    keyboard_irq: Arc<EventFd>,
+
+    // 新增: 鼠标缓冲区
+    mouse_buffer: VecDeque<u8>,
+    mouse_irq: Arc<EventFd>,
+
+    // 控制器状态
+    status: u8,
+    command_byte: u8,
+}
+
+/// PS/2 鼠标数据包 (Intellimouse 扩展)
+#[repr(C, packed)]
+struct Ps2MousePacket {
+    byte1: u8,  // [Y overflow][X overflow][Y sign][X sign][1][MB][RB][LB]
+    byte2: u8,  // X movement (-255 to 255)
+    byte3: u8,  // Y movement (-255 to 255)
+    byte4: u8,  // Z movement (滚轮, -8 to 7)
+}
+
+impl I8042DeviceExtended {
+    /// 注入键盘扫描码
+    pub fn inject_keyboard(&mut self, scancode: u8) {
+        self.keyboard_buffer.push_back(scancode);
+        // 触发 IRQ1
+        self.keyboard_irq.write(1).ok();
+    }
+
+    /// 注入鼠标移动
+    pub fn inject_mouse_move(&mut self, dx: i8, dy: i8, buttons: u8, wheel: i8) {
+        let packet = Ps2MousePacket {
+            byte1: 0x08 | buttons |
+                   (if dy < 0 { 0x20 } else { 0 }) |
+                   (if dx < 0 { 0x10 } else { 0 }),
+            byte2: dx as u8,
+            byte3: dy as u8,
+            byte4: (wheel * 1) as u8,
+        };
+        self.mouse_buffer.push_back(packet.byte1);
+        self.mouse_buffer.push_back(packet.byte2);
+        self.mouse_buffer.push_back(packet.byte3);
+        self.mouse_buffer.push_back(packet.byte4);
+        // 触发 IRQ12
+        self.mouse_irq.write(1).ok();
+    }
+}
+```
+
+**优点:**
+- ✅ **最隐蔽** - PS/2 是传统接口，系统高度信任
+- ✅ **无法被软件检测** - 不经过 USB/PCI 总线
+- ✅ **低级接口** - 比任何虚拟设备都更接近硬件
+- ✅ **任何 OS 原生支持** - 无需驱动
+
+**缺点:**
+- ⚠️ 需要扩展 Cloud Hypervisor 现有的 i8042 实现
+- ⚠️ PS/2 协议功能有限 (无绝对坐标)
+
+#### 方案 2: virtio-input (实现最简单，适合普通场景)
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -659,7 +768,17 @@ impl VirtioDevice for InputDevice {
 }
 ```
 
-#### 方案 2: USB HID 模拟 (xHCI)
+**优点:**
+- ✅ 实现最简单 (复用 VirtIO 基础设施)
+- ✅ Linux 原生支持 (evdev)
+- ✅ 支持多种输入设备类型
+
+**缺点:**
+- ❌ **容易被检测为虚拟设备** (VirtIO Vendor ID)
+- ❌ Windows 需要安装 virtio-win 驱动
+- ❌ 不适合自动化/反作弊场景
+
+#### 方案 3: USB HID 模拟 (xHCI)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -667,21 +786,40 @@ impl VirtioDevice for InputDevice {
 │  ┌─────────────────────────────────────────────────────────┐│
 │  │                    xHCI 控制器 (需新增)                  ││
 │  │  ┌─────────────────────────────────────────────────────┐││
-│  │  │  USB 设备模拟                                       │││
-│  │  │  ┌───────────────┐  ┌───────────────┐              │││
-│  │  │  │ HID Keyboard  │  │ HID Mouse     │              │││
-│  │  │  │ (设备描述符)  │  │ (设备描述符)  │              │││
-│  │  │  │ Report格式   │  │ Report格式    │              │││
-│  │  │  └───────────────┘  └───────────────┘              │││
+│  │  │  USB HID 设备 (模拟真实设备)                        │││
+│  │  │                                                     │││
+│  │  │  键盘模拟:                                          │││
+│  │  │  ┌───────────────────────────────────────────────┐  │││
+│  │  │  │ Vendor ID:    0x046D (Logitech)              │  │││
+│  │  │  │ Product ID:   0xC31C (K120 Keyboard)         │  │││
+│  │  │  │ Manufacturer: "Logitech"                     │  │││
+│  │  │  │ Product:      "USB Keyboard"                 │  │││
+│  │  │  └───────────────────────────────────────────────┘  │││
+│  │  │                                                     │││
+│  │  │  鼠标模拟:                                          │││
+│  │  │  ┌───────────────────────────────────────────────┐  │││
+│  │  │  │ Vendor ID:    0x046D (Logitech)              │  │││
+│  │  │  │ Product ID:   0xC077 (M105 Mouse)            │  │││
+│  │  │  │ Manufacturer: "Logitech"                     │  │││
+│  │  │  │ Product:      "USB Optical Mouse"            │  │││
+│  │  │  └───────────────────────────────────────────────┘  │││
 │  │  └─────────────────────────────────────────────────────┘││
 │  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
-
-优点: Windows 原生支持无需驱动、支持任意 HID 设备、标准化程度最高
-缺点: 实现复杂、Cloud Hypervisor 目前没有 xHCI 设备模拟
 ```
 
-#### 方案 3: i8042 + PS/2 鼠标 (传统方案，不推荐)
+**优点:**
+- ✅ Windows 原生支持无需驱动
+- ✅ 支持任意 HID 设备
+- ✅ 可伪装成真实设备 (自定义 VID/PID)
+- ✅ 适合 RPA 和自动化测试场景
+
+**缺点:**
+- ❌ 实现复杂 (需要 xHCI 控制器 + USB 设备模拟)
+- ❌ Cloud Hypervisor 目前没有 xHCI 实现
+- ⚠️ 高级反作弊可能检测 USB 描述符异常
+
+#### 方案 4: i8042 + PS/2 鼠标 (传统方案，不推荐)
 
 ```
 ┌──────────────────────────────────────────────────────┐
